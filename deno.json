@@ -1,7 +1,7 @@
 {
   "name": "@neabyte/byte-tokenizer",
-  "description": "Encode text as UTF-8 bytes and special tokens",
-  "version": "0.1.0",
+  "description": "Encode text into deterministic byte IDs and special tokens",
+  "version": "0.2.0",
   "type": "module",
   "license": "MIT",
   "exports": "./src/index.ts",

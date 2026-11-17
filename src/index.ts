@@ -1,22 +1,41 @@
 /**
- * Byte and special-token tokenizer.
- * @description Maps UTF-8 bytes and configured special tokens.
+ * Deterministic subword and special-token tokenizer.
+ * @description Maps subword chunks via bijective base-256 and special tokens.
  */
 export default class ByteTokenizer {
+  /** Bijective base for chunk IDs */
+  static readonly #base = 256
+  /** Highest chunk ID, special tokens start after this */
+  static readonly #chunkLimit = ByteTokenizer.#base * ByteTokenizer.#base + ByteTokenizer.#base
   /** UTF-8 decoder that keeps a leading BOM */
   static readonly #decoder = new TextDecoder('utf-8', { fatal: false, ignoreBOM: true })
   /** UTF-8 encoder for text and special tokens */
   static readonly #encoder = new TextEncoder()
-  /** Special-token bytes keyed by token ID */
-  #idToToken: Map<number, Uint8Array>
-  /** Special-token text keyed by token ID */
-  #tokenToId: Map<string, number>
+  /** UTF-8 bytes packed per chunk ID */
+  static readonly #maxBytes = 2
+  /** Case-aware subword pattern covering all text */
+  static readonly #pattern = [
+    '\\p{N}{1,3}',
+    '[一-龥぀-ゟ゠-ヿ]+',
+    "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+    "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+    ' ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*',
+    '\\s*[\\r\\n]+',
+    '\\s+(?!\\S)',
+    '\\s+'
+  ].join('|')
+  /** Subword matcher for plain text slices */
+  static readonly #regex = new RegExp(ByteTokenizer.#pattern, 'gu')
   /** Special tokens sorted longest first */
   #token: string[]
+  /** Special-token bytes keyed by token ID */
+  #tokenBytes: Map<number, Uint8Array>
+  /** Special-token text keyed by token ID */
+  #tokenIds: Map<string, number>
 
   /**
    * Build tokenizer from special tokens.
-   * @description Assigns IDs from 256 and ignores duplicates.
+   * @description Assigns IDs after the chunk range and ignores duplicates.
    * @param specialToken - Special token strings
    * @throws TypeError when the argument or a token is invalid
    */
@@ -25,20 +44,20 @@ export default class ByteTokenizer {
       throw new TypeError('Special token must be an array of strings')
     }
     this.#token = []
-    this.#tokenToId = new Map<string, number>()
-    this.#idToToken = new Map<number, Uint8Array>()
+    this.#tokenIds = new Map<string, number>()
+    this.#tokenBytes = new Map<number, Uint8Array>()
     for (let index = 0; index < specialToken.length; index++) {
       const token = specialToken[index]
       if (typeof token !== 'string' || token.length === 0) {
         throw new TypeError('Each special token must be a non-empty string')
       }
-      if (this.#tokenToId.has(token)) {
+      if (this.#tokenIds.has(token)) {
         continue
       }
-      const identifier = 256 + this.#tokenToId.size
+      const identifier = ByteTokenizer.#chunkLimit + 1 + this.#tokenIds.size
       this.#token.push(token)
-      this.#tokenToId.set(token, identifier)
-      this.#idToToken.set(identifier, ByteTokenizer.#encoder.encode(token))
+      this.#tokenIds.set(token, identifier)
+      this.#tokenBytes.set(identifier, ByteTokenizer.#encoder.encode(token))
     }
     this.#token.sort((left, right) => right.length - left.length)
   }
@@ -59,34 +78,39 @@ export default class ByteTokenizer {
     ) {
       throw new TypeError('Identifier must be an array-like object of integers')
     }
-    const limit = 256 + this.#idToToken.size
-    let total = 0
+    const limit = ByteTokenizer.#chunkLimit + 1 + this.#tokenBytes.size
     for (let index = 0; index < identifier.length; index++) {
       const value = identifier[index]
       if (typeof value !== 'number' || !Number.isInteger(value)) {
         throw new TypeError(`Token ID at index ${index} must be an integer`)
       }
-      if (value < 0 || Object.is(value, -0) || value >= limit) {
+      if (value < 1 || Object.is(value, -0) || value >= limit) {
         throw new RangeError(
-          `Token ID ${value} at index ${index} is out of range [0, ${limit - 1}]`
+          `Token ID ${value} at index ${index} is out of range [1, ${limit - 1}]`
         )
       }
-      const token = this.#idToToken.get(value)
-      total += token !== undefined ? token.length : 1
     }
-    const buffer = new Uint8Array(total)
-    let offset = 0
+    const bytes: number[] = []
     for (let index = 0; index < identifier.length; index++) {
       const value = identifier[index] as number
-      const token = this.#idToToken.get(value)
+      const token = this.#tokenBytes.get(value)
       if (token !== undefined) {
-        buffer.set(token, offset)
-        offset += token.length
-      } else {
-        buffer[offset++] = value
+        bytes.push(...token)
+        continue
       }
+      const chunk: number[] = []
+      let remainder = value
+      while (remainder > 0) {
+        let digit = remainder % ByteTokenizer.#base
+        if (digit === 0) {
+          digit = ByteTokenizer.#base
+        }
+        chunk.unshift(digit - 1)
+        remainder = (remainder - digit) / ByteTokenizer.#base
+      }
+      bytes.push(...chunk)
     }
-    return ByteTokenizer.#decoder.decode(buffer)
+    return ByteTokenizer.#decoder.decode(Uint8Array.from(bytes))
   }
 
   /**
@@ -100,8 +124,8 @@ export default class ByteTokenizer {
     if (typeof text !== 'string') {
       throw new TypeError('Text must be a string')
     }
-    if (this.#token.length === 0) {
-      return Array.from(ByteTokenizer.#encoder.encode(text))
+    if (/\p{Surrogate}/u.test(text)) {
+      throw new TypeError('Text contains an unpaired surrogate')
     }
     const identifier: number[] = []
     let cursor = 0
@@ -115,42 +139,44 @@ export default class ByteTokenizer {
         }
       }
       if (matched !== undefined) {
-        identifier.push(this.#tokenToId.get(matched) as number)
+        identifier.push(this.#tokenIds.get(matched) as number)
         cursor += matched.length
         continue
       }
-      const next = this.#next(text, cursor)
-      const bytes = ByteTokenizer.#encoder.encode(text.slice(cursor, next))
-      for (let index = 0; index < bytes.length; index++) {
-        const value = bytes[index]
-        if (value !== undefined) {
-          identifier.push(value)
+      let boundary = text.length
+      for (let index = 0; index < this.#token.length; index++) {
+        const token = this.#token[index]
+        if (token === undefined) {
+          continue
+        }
+        const found = text.indexOf(token, cursor + 1)
+        if (found !== -1 && found < boundary) {
+          boundary = found
         }
       }
-      cursor = next
+      const slice = text.slice(cursor, boundary)
+      let offset = 0
+      ByteTokenizer.#regex.lastIndex = 0
+      let match: RegExpExecArray | null
+      while ((match = ByteTokenizer.#regex.exec(slice)) !== null) {
+        if (match.index !== offset) {
+          throw new RangeError(`Pattern left text uncovered at ${offset}`)
+        }
+        const bytes = ByteTokenizer.#encoder.encode(match[0])
+        for (let start = 0; start < bytes.length; start += ByteTokenizer.#maxBytes) {
+          let chunkId = 0
+          for (const byte of bytes.subarray(start, start + ByteTokenizer.#maxBytes)) {
+            chunkId = chunkId * ByteTokenizer.#base + byte + 1
+          }
+          identifier.push(chunkId)
+        }
+        offset += match[0].length
+      }
+      if (offset !== slice.length) {
+        throw new RangeError(`Pattern left text uncovered at ${offset}`)
+      }
+      cursor = boundary
     }
     return identifier
-  }
-
-  /**
-   * Find the next special token.
-   * @description Searches after the current cursor position.
-   * @param text - Text being encoded
-   * @param cursor - Current character offset
-   * @returns Offset of the next token or text end
-   */
-  #next(text: string, cursor: number): number {
-    let next = text.length
-    for (let index = 0; index < this.#token.length; index++) {
-      const token = this.#token[index]
-      if (token === undefined) {
-        continue
-      }
-      const found = text.indexOf(token, cursor + 1)
-      if (found !== -1 && found < next) {
-        next = found
-      }
-    }
-    return next
   }
 }
